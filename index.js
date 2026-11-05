@@ -90,6 +90,43 @@ app.post('/add-studio', async (req, res) => {
     }
 })
 
+// GET /studios
+// Fetches studio listings from the `studios` collection in the StudioSpace database.
+// Optional query parameters:
+//   ?limit=4      -> limit the number of returned documents (e.g. 4-6 featured items for the homepage)
+//   ?category=X   -> filter listings by category (e.g. "Photo Studio", "Film Stage", ...)
+// Examples:
+//   GET /studios                          -> all studios
+//   GET /studios?limit=6                  -> 6 featured studios for the homepage
+//   GET /studios?category=Podcast%20Lounge-> only podcast lounges
+app.get('/studios', async (req, res) => {
+    try {
+        const { limit, category } = req.query;
+
+        const query = {};
+        if (category) {
+            query.category = category;
+        }
+
+        // parse limit as an integer, guarding against invalid values like ?limit=abc
+        const parsedLimit = limit ? parseInt(limit, 10) : null;
+
+        let cursor = db.collection('studios').find(query);
+        if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
+            cursor = cursor.limit(parsedLimit);
+        }
+
+        const studios = await cursor
+            .sort({ createdAt: -1 })  // newest first
+            .toArray();
+
+        return res.status(200).send(studios);
+    } catch (err) {
+        console.error('Failed to fetch studios:', err);
+        return res.status(500).send({ message: 'Failed to fetch studios', error: err.message });
+    }
+})
+
 
 app.get('/', (req, res) => {
     res.send({ msg: "server is running fine " })
