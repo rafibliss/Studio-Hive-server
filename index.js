@@ -2,19 +2,130 @@ import express from 'express'
 import 'dotenv/config'
 import { MongoClient } from 'mongodb';
 import cors from "cors"
+import { betterAuth } from 'better-auth';
+import { mongodbAdapter } from 'better-auth/adapters/mongodb';
+import { toNodeHandler } from 'better-auth/node';
 
 
 const app = express()
 const PORT = 8000;
 
 
-app.use(express.json())
-app.use(cors());
-
-
 const client = new MongoClient(process.env.MONGODB_URI);
 
 const db = client.db('StudioSpace');
+
+
+export const auth = betterAuth({
+    secret: process.env.BETTER_AUTH_SECRET,
+    baseURL: process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`,
+    trustedOrigins: ['http://localhost:3000'],
+    database: mongodbAdapter(db, { client }),
+    emailAndPassword: {
+        enabled: true,
+        minPasswordLength: 8,
+    },
+});
+
+
+app.use(cors({
+    origin: 'http://localhost:3000',
+    credentials: true,
+}));
+
+
+const nuAuth = toNodeHandler(auth);
+const AUTH_ALIASES = new Set(['/api/auth/sign-in', '/api/auth/sign-up', '/api/auth/me']);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/auth/') && !AUTH_ALIASES.has(req.path)) {
+        return nuAuth(req, res, next);
+    }
+    next();
+});
+
+app.use(express.json());
+
+
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+
+app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
+    const { email, password } = req.body ?? {};
+
+    if (!email || !password) {
+        return res.status(400).send({ message: 'Email and password are required and cannot be empty' });
+    }
+    if (!EMAIL_RE.test(email)) {
+        return res.status(400).send({ message: 'Invalid email format' });
+    }
+
+    try {
+
+        const response = await auth.api.signInEmail({ body: { email, password }, asResponse: true });
+        for (const cookie of response.headers.getSetCookie()) {
+            res.append('Set-Cookie', cookie);
+        }
+        const user = await response.json();
+
+        return res.status(response.status).send(user);
+    } catch (err) {
+        console.error('Sign-in failed:', err);
+        return res.status(500).send({ message: 'Sign-in failed', error: err.message });
+    }
+});
+
+
+app.post(['/api/auth/sign-up', '/api/register'], async (req, res) => {
+    const { name, email, password } = req.body ?? {};
+
+    if (!name || !email || !password) {
+        return res.status(400).send({ message: 'Name, email and password are required and cannot be empty' });
+    }
+    if (!EMAIL_RE.test(email)) {
+        return res.status(400).send({ message: 'Invalid email format' });
+    }
+    if (typeof password !== 'string' || password.length < 8) {
+        return res.status(400).send({ message: 'Password must be at least 8 characters' });
+    }
+
+    try {
+        const response = await auth.api.signUpEmail({ body: { name, email, password }, asResponse: true });
+
+
+        if (response.status === 422) {
+            const body = await response.json().catch(() => ({}));
+            return res.status(400).send({
+                message: 'Email is already registered',
+                code: body?.code || 'USER_ALREADY_EXISTS',
+            });
+        }
+
+        for (const cookie of response.headers.getSetCookie()) {
+            res.append('Set-Cookie', cookie);
+        }
+        const user = await response.json();
+        return res.status(response.status).send(user);
+    } catch (err) {
+        console.error('Sign-up failed:', err);
+        return res.status(500).send({ message: 'Sign-up failed', error: err.message });
+    }
+});
+
+
+app.get(['/api/auth/me', '/api/session'], async (req, res) => {
+    try {
+        const session = await auth.api.getSession({ headers: req.headers });
+        return res.status(200).send({
+            authenticated: Boolean(session),
+            user: session?.user ?? null,
+            session: session?.session ?? null,
+        });
+    } catch (err) {
+        console.error('Session check failed:', err);
+        return res.status(500).send({ message: 'Session check failed', error: err.message });
+    }
+});
 
 export async function connectToMongoDB() {
     try {
