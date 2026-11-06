@@ -49,7 +49,7 @@ app.use(express.json());
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-
+//login 
 app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
     const { email, password } = req.body ?? {};
 
@@ -75,7 +75,7 @@ app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
     }
 });
 
-
+//signup
 app.post(['/api/auth/sign-up', '/api/register'], async (req, res) => {
     const { name, email, password } = req.body ?? {};
 
