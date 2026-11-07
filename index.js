@@ -1,4 +1,5 @@
 import express from 'express'
+// const { ObjectId } = require('mongodb');
 import 'dotenv/config'
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from "cors"
@@ -246,6 +247,78 @@ app.get('/studios/:id', async (req, res) => {
         return res.status(500).send({ message: 'Failed to fetch studio', error: err.message });
     }
 })
+
+// ==========================================
+// 1. PUT /studios/:id (Update a studio listing)
+// ==========================================
+app.put('/studios/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+        const updatedData = req.body;
+
+        const query = { _id: new ObjectId(id) };
+
+        // Helper to safely parse numbers if sent as strings from the form
+        const toNumber = (v) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? n : v;
+        };
+
+        const updateDoc = {
+            $set: {
+                ...(updatedData.title && { title: updatedData.title }),
+                ...(updatedData.category && { category: updatedData.category }),
+                ...(updatedData.hourlyRate !== undefined && { hourlyRate: toNumber(updatedData.hourlyRate) }),
+                ...(updatedData.securityDeposit !== undefined && { securityDeposit: toNumber(updatedData.securityDeposit) }),
+                ...(updatedData.maxCapacity !== undefined && { maxCapacity: toNumber(updatedData.maxCapacity) }),
+                ...(updatedData.location && { location: updatedData.location }),
+                ...(updatedData.imageUrl && { imageUrl: updatedData.imageUrl }),
+                ...(updatedData.amenities && { amenities: updatedData.amenities }),
+                ...(updatedData.overview && { overview: updatedData.overview }),
+            }
+        };
+
+        const result = await db.collection('studios').updateOne(query, updateDoc);
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({ message: 'Studio not found' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: 'Studio updated successfully',
+            result
+        });
+    } catch (err) {
+        console.error('Failed to update studio:', err);
+        return res.status(500).send({ message: 'Failed to update studio', error: err.message });
+    }
+});
+
+// ==========================================
+// 2. DELETE /studios/:id (Delete a studio listing)
+// ==========================================
+app.delete('/studios/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+        const query = { _id: new ObjectId(id) };
+
+        const result = await db.collection('studios').deleteOne(query);
+
+        if (result.deletedCount === 0) {
+            return res.status(404).send({ message: 'Studio not found' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: 'Studio deleted successfully',
+            result
+        });
+    } catch (err) {
+        console.error('Failed to delete studio:', err);
+        return res.status(500).send({ message: 'Failed to delete studio', error: err.message });
+    }
+});
 
 
 app.get('/', (req, res) => {
