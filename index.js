@@ -25,9 +25,7 @@ export const auth = betterAuth({
         enabled: true,
         minPasswordLength: 8,
     },
-    // Google OAuth. Credentials come from .env (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).
-    // Until real credentials are present, requests to the social sign-in endpoint
-    // fail with an auth error - they don't crash the server.
+
     socialProviders: {
         google: {
             clientId: process.env.GOOGLE_CLIENT_ID,
