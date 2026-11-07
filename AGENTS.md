@@ -18,6 +18,7 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
 - Alias routes (validate input, delegate to `auth.api.*` with `asResponse: true`): `POST /api/auth/sign-in` + `/api/login`, `POST /api/auth/sign-up` + `/api/register`, `GET /api/auth/me` + `/api/session` (returns `{ authenticated, user, session }`). Better Auth's native routes (`/api/auth/sign-in/email`, `/api/auth/sign-up/email`, `/api/auth/get-session`) also work.
 - Sign-up "already exists" comes back from Better Auth as 422; the alias maps it to 400 with `message: 'Email is already registered'`.
 - Env: `BETTER_AUTH_SECRET` and `BETTER_AUTH_URL` in `.env` (gitignored) alongside `MONGODB_URI`. CORS allows credentials from `http://localhost:3000` only.
+- **Google OAuth** is configured via `socialProviders.google` (`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in `.env`). Frontend starts the flow with `POST /api/auth/sign-in/social` `{ provider: 'google', callbackURL }`, which returns the Google consent URL; the OAuth callback lands on `/api/auth/callback/google` (a Better Auth native route — do NOT add it to `AUTH_ALIASES`). The redirect URI must be registered as an Authorized redirect URI in Google Cloud Console.
 
 ## Gotchas
 

@@ -1,6 +1,6 @@
 import express from 'express'
 import 'dotenv/config'
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import cors from "cors"
 import { betterAuth } from 'better-auth';
 import { mongodbAdapter } from 'better-auth/adapters/mongodb';
@@ -24,6 +24,15 @@ export const auth = betterAuth({
     emailAndPassword: {
         enabled: true,
         minPasswordLength: 8,
+    },
+    // Google OAuth. Credentials come from .env (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).
+    // Until real credentials are present, requests to the social sign-in endpoint
+    // fail with an auth error - they don't crash the server.
+    socialProviders: {
+        google: {
+            clientId: process.env.GOOGLE_CLIENT_ID,
+            clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+        },
     },
 });
 
@@ -209,6 +218,32 @@ app.get('/studios', async (req, res) => {
     } catch (err) {
         console.error('Failed to fetch studios:', err);
         return res.status(500).send({ message: 'Failed to fetch studios', error: err.message });
+    }
+})
+
+
+//studio details by id:
+app.get('/studios/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Guard against malformed ids (invalid ObjectId would throw)
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Studio not found' });
+        }
+
+        const studio = await db
+            .collection('studios')
+            .findOne({ _id: new ObjectId(id) });
+
+        if (!studio) {
+            return res.status(404).send({ message: 'Studio not found' });
+        }
+
+        return res.status(200).send(studio);
+    } catch (err) {
+        console.error('Failed to fetch studio:', err);
+        return res.status(500).send({ message: 'Failed to fetch studio', error: err.message });
     }
 })
 
