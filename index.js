@@ -193,11 +193,13 @@ app.post('/add-studio', async (req, res) => {
 //all studios api:
 app.get('/studios', async (req, res) => {
     try {
-        const { limit, category } = req.query;
-
+        const { limit, category, email } = req.query;
         const query = {};
         if (category) {
             query.category = category;
+        }
+        if (email) {
+            query.hostEmail = email;
         }
 
 
@@ -217,7 +219,7 @@ app.get('/studios', async (req, res) => {
         console.error('Failed to fetch studios:', err);
         return res.status(500).send({ message: 'Failed to fetch studios', error: err.message });
     }
-})
+});
 
 
 //studio details by id:
