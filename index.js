@@ -249,45 +249,73 @@ app.get('/studios/:id', async (req, res) => {
 })
 
 // ==========================================
-// 1. PUT /studios/:id (Update a studio listing)
+// PUT /studios/:id  (also /api/studios/:id)
+// Update a studio listing. Numeric fields are cast/validated before $set,
+// and the full updated document is returned.
 // ==========================================
-app.put('/studios/:id', async (req, res) => {
+const STUDIO_UPDATE_FIELDS = ['title', 'category', 'location', 'imageUrl', 'overview', 'hostName', 'hostEmail'];
+const STUDIO_NUMBER_FIELDS = ['hourlyRate', 'securityDeposit', 'maxCapacity'];
+
+app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
     try {
-        const id = req.params.id;
-        const updatedData = req.body;
+        const { id } = req.params;
+        const updatedData = req.body ?? {};
 
-        const query = { _id: new ObjectId(id) };
+        // validation failure -> 400, no matching document -> 404
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({ message: 'Invalid studio id' });
+        }
 
-        // Helper to safely parse numbers if sent as strings from the form
-        const toNumber = (v) => {
-            const n = Number(v);
-            return Number.isFinite(n) ? n : v;
-        };
+        const setFields = {};
 
-        const updateDoc = {
-            $set: {
-                ...(updatedData.title && { title: updatedData.title }),
-                ...(updatedData.category && { category: updatedData.category }),
-                ...(updatedData.hourlyRate !== undefined && { hourlyRate: toNumber(updatedData.hourlyRate) }),
-                ...(updatedData.securityDeposit !== undefined && { securityDeposit: toNumber(updatedData.securityDeposit) }),
-                ...(updatedData.maxCapacity !== undefined && { maxCapacity: toNumber(updatedData.maxCapacity) }),
-                ...(updatedData.location && { location: updatedData.location }),
-                ...(updatedData.imageUrl && { imageUrl: updatedData.imageUrl }),
-                ...(updatedData.amenities && { amenities: updatedData.amenities }),
-                ...(updatedData.overview && { overview: updatedData.overview }),
+        // string fields: only apply when provided, must be a non-empty string
+        for (const field of STUDIO_UPDATE_FIELDS) {
+            if (updatedData[field] !== undefined) {
+                if (typeof updatedData[field] !== 'string') {
+                    return res.status(400).send({ message: `'${field}' must be a string` });
+                }
+                setFields[field] = updatedData[field];
             }
-        };
+        }
 
-        const result = await db.collection('studios').updateOne(query, updateDoc);
+        // numeric fields: cast form values ("55") to numbers, reject garbage
+        for (const field of STUDIO_NUMBER_FIELDS) {
+            if (updatedData[field] !== undefined && updatedData[field] !== '') {
+                const n = Number(updatedData[field]);
+                if (!Number.isFinite(n) || n < 0) {
+                    return res.status(400).send({ message: `'${field}' must be a valid non-negative number` });
+                }
+                setFields[field] = n;
+            }
+        }
 
-        if (result.matchedCount === 0) {
+        // amenities: must be an array of strings when provided
+        if (updatedData.amenities !== undefined) {
+            if (!Array.isArray(updatedData.amenities) || updatedData.amenities.some((a) => typeof a !== 'string')) {
+                return res.status(400).send({ message: `'amenities' must be an array of strings` });
+            }
+            setFields.amenities = updatedData.amenities;
+        }
+
+        if (Object.keys(setFields).length === 0) {
+            return res.status(400).send({ message: 'No valid studio fields provided to update' });
+        }
+
+        // native driver equivalent of findByIdAndUpdate(id, data, { new: true })
+        const updatedStudio = await db.collection('studios').findOneAndUpdate(
+            { _id: new ObjectId(id) },
+            { $set: setFields },
+            { returnDocument: 'after' },  // return the document as it looks AFTER the update
+        );
+
+        if (!updatedStudio) {
             return res.status(404).send({ message: 'Studio not found' });
         }
 
         return res.status(200).send({
             success: true,
             message: 'Studio updated successfully',
-            result
+            studio: updatedStudio,
         });
     } catch (err) {
         console.error('Failed to update studio:', err);
@@ -296,29 +324,222 @@ app.put('/studios/:id', async (req, res) => {
 });
 
 // ==========================================
-// 2. DELETE /studios/:id (Delete a studio listing)
+// DELETE /studios/:id  (also /api/studios/:id)
+// Delete a studio listing by its _id.
 // ==========================================
-app.delete('/studios/:id', async (req, res) => {
+app.delete(['/studios/:id', '/api/studios/:id'], async (req, res) => {
     try {
-        const id = req.params.id;
-        const query = { _id: new ObjectId(id) };
+        const { id } = req.params;
 
-        const result = await db.collection('studios').deleteOne(query);
+        // an id that can't exist matches no document -> 404 (same as a miss)
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Studio not found' });
+        }
 
-        if (result.deletedCount === 0) {
+        // native driver equivalent of findByIdAndDelete(id)
+        const deletedStudio = await db.collection('studios').findOneAndDelete({ _id: new ObjectId(id) });
+
+        if (!deletedStudio) {
             return res.status(404).send({ message: 'Studio not found' });
         }
 
         return res.status(200).send({
             success: true,
             message: 'Studio deleted successfully',
-            result
         });
     } catch (err) {
         console.error('Failed to delete studio:', err);
         return res.status(500).send({ message: 'Failed to delete studio', error: err.message });
     }
 });
+
+
+// ==========================================
+// Bookings (StudioSpace booking system)
+// ==========================================
+
+// POST /bookings (also /api/bookings)
+// Creates a booking reservation. Default status "Pending" + createdAt timestamp.
+app.post(['/bookings', '/api/bookings'], async (req, res) => {
+    try {
+        const { studioId, studioTitle, studioImage, location, hourlyRate, userName, userEmail, bookingDate, timeSlot } = req.body ?? {};
+
+        if (!studioId || !userEmail) {
+            return res.status(400).send({ message: "'studioId' and 'userEmail' are required" });
+        }
+        if (!bookingDate || !timeSlot) {
+            return res.status(400).send({ message: "'bookingDate' and 'timeSlot' are required" });
+        }
+
+        const n = Number(hourlyRate);
+        const newBooking = {
+            studioId,                       // stored as sent; stringify-safe for the frontend
+            studioTitle: studioTitle || '',
+            studioImage: studioImage || '',
+            location: location || '',
+            hourlyRate: Number.isFinite(n) ? n : null,
+            userName: userName || '',
+            userEmail,
+            bookingDate,
+            timeSlot,
+            status: 'Pending',              // default status
+            createdAt: new Date(),          // timestamp
+        };
+
+        const result = await db.collection('bookings').insertOne(newBooking);
+        console.log(`Booking created for ${userEmail} (${studioTitle || studioId}) -> ${result.insertedId}`);
+
+        return res.status(201).send({
+            success: true,
+            message: 'Booking created successfully',
+            insertedId: result.insertedId,
+        });
+    } catch (err) {
+        console.error('Failed to create booking:', err);
+        return res.status(500).send({ message: 'Failed to create booking', error: err.message });
+    }
+});
+
+// GET /bookings (also /api/bookings)
+// Optional filter: /bookings?email=user@example.com -> matches userEmail.
+// Always sorted by createdAt descending (newest first).
+app.get(['/bookings', '/api/bookings'], async (req, res) => {
+    try {
+        const { email } = req.query;
+
+        const query = {};
+        if (email) {
+            query.userEmail = email;
+        }
+
+        const bookings = await db.collection('bookings')
+            .find(query)
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        return res.status(200).send(bookings);
+    } catch (err) {
+        console.error('Failed to fetch bookings:', err);
+        return res.status(500).send({ message: 'Failed to fetch bookings', error: err.message });
+    }
+});
+
+// DELETE /bookings/:id (also /api/bookings/:id)
+// Removes a booking by its _id (ObjectId).
+app.delete(['/bookings/:id', '/api/bookings/:id'], async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        const deleted = await db.collection('bookings').findOneAndDelete({ _id: new ObjectId(id) });
+
+        if (!deleted) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: 'Booking deleted successfully',
+        });
+    } catch (err) {
+        console.error('Failed to delete booking:', err);
+        return res.status(500).send({ message: 'Failed to delete booking', error: err.message });
+    }
+});
+
+
+//booking creation api:
+app.post('/bookings', async (req, res) => {
+    try {
+        const { studioId, studioTitle, studioImage, location, hourlyRate, userName, userEmail, bookingDate, timeSlot } = req.body ?? {};
+
+        if (!studioId || !userEmail || !bookingDate || !timeSlot) {
+            return res.status(400).send({ message: 'studioId, userEmail, bookingDate, and timeSlot are required' });
+        }
+        if (!ObjectId.isValid(studioId)) {
+            return res.status(400).send({ message: 'Invalid studioId' });
+        }
+        if (hourlyRate !== undefined && hourlyRate !== null && !Number.isFinite(Number(hourlyRate))) {
+            return res.status(400).send({ message: 'hourlyRate must be a number' });
+        }
+
+        const newBooking = {
+            studioId,
+            studioTitle: studioTitle || null,
+            studioImage: studioImage || null,
+            location: location || null,
+            hourlyRate: hourlyRate !== undefined && hourlyRate !== null ? Number(hourlyRate) : null,
+            userName: userName || null,
+            userEmail,
+            bookingDate,
+            timeSlot,
+            status: 'Pending',
+            createdAt: new Date(),
+        };
+
+        const result = await db.collection('bookings').insertOne(newBooking);
+        console.log(`Booking for studio "${studioTitle}" created with _id: ${result.insertedId}`);
+
+        return res.status(201).send({
+            message: 'Booking created successfully',
+            insertedId: result.insertedId,
+        });
+    } catch (err) {
+        console.error('Failed to create booking:', err);
+        return res.status(500).send({ message: 'Failed to create booking', error: err.message });
+    }
+})
+
+//bookings by user email:
+app.get('/bookings', async (req, res) => {
+    try {
+        const { email } = req.query;
+
+        const query = {};
+        // "My Bookings": allow filtering by the booker's email
+        if (email) {
+            query.userEmail = email;
+        }
+
+        const bookings = await db.collection('bookings')
+            .find(query)
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        return res.status(200).send(bookings);
+    } catch (err) {
+        console.error('Failed to fetch bookings:', err);
+        return res.status(500).send({ message: 'Failed to fetch bookings', error: err.message });
+    }
+})
+
+//cancel (delete) a booking by id:
+app.delete('/bookings/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        const result = await db.collection('bookings').deleteOne({ _id: new ObjectId(id) });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: 'Booking deleted successfully',
+        });
+    } catch (err) {
+        console.error('Failed to delete booking:', err);
+        return res.status(500).send({ message: 'Failed to delete booking', error: err.message });
+    }
+})
 
 
 app.get('/', (req, res) => {

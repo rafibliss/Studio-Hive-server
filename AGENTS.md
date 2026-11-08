@@ -11,6 +11,12 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
 - No lint, typecheck, or build step.
 - Manual verification: `curl http://localhost:8000` → `{"msg":"server is running fine "}`.
 
+## Data endpoints (all JSON + CORS-credentialed from localhost:3000)
+
+- Studios: `POST /add-studio`, `GET /studios` (`?limit`, `?category`, `?email`), `GET /studios/:id`, `PUT`/`DELETE /studios/:id` (both also under `/api/studios/:id`).
+  - Update/delete validate the ObjectId first: malformed id → 400/404, well-formed-but-missing → 404. PUT casts numeric fields (`hourlyRate`, `securityDeposit`, `maxCapacity`) and rejects bad types with 400; returns `{ success, message, studio }` (the doc after update).
+- Bookings (collection `bookings`): `POST /bookings` (requires `studioId`, `userEmail`, `bookingDate`, `timeSlot`; defaults `status: "Pending"`, `createdAt: now`), `GET /bookings` (`?email=` maps to `userEmail`, sorted `createdAt: -1`), `DELETE /bookings/:id`. All also under `/api/bookings`.
+
 ## Auth (Better Auth)
 
 - `auth` instance lives in `index.js`, backed by the same Mongo client (`mongodbAdapter(db, { client })`); creates `user`/`account`/`session` collections in StudioSpace.
