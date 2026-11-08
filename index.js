@@ -6,6 +6,8 @@ import cors from "cors"
 import { betterAuth } from 'better-auth';
 import { mongodbAdapter } from 'better-auth/adapters/mongodb';
 import { toNodeHandler } from 'better-auth/node';
+import jwt from 'jsonwebtoken';
+import cookieParser from 'cookie-parser';
 
 
 const app = express()
@@ -52,6 +54,43 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+app.use(cookieParser());
+
+
+
+// JWT
+function createToken(user) {
+    return jwt.sign(
+        { id: user.id, email: user.email },
+        process.env.JWT_SECRET,
+        { expiresIn: '1d' },
+    );
+}
+
+
+function sendTokenCookie(res, user) {
+    res.cookie('token', createToken(user), {
+        httpOnly: true,
+        sameSite: 'lax',
+        maxAge: 24 * 60 * 60 * 1000,
+    });
+}
+
+
+function verifyToken(req, res, next) {
+    const token = req.cookies?.token;
+
+    if (!token) {
+        return res.status(401).send({ message: 'Unauthorized: no token provided' });
+    }
+
+    try {
+        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        next();
+    } catch (err) {
+        return res.status(401).send({ message: 'Unauthorized: invalid or expired token' });
+    }
+}
 
 
 
@@ -74,9 +113,14 @@ app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
         for (const cookie of response.headers.getSetCookie()) {
             res.append('Set-Cookie', cookie);
         }
-        const user = await response.json();
+        const body = await response.json();
 
-        return res.status(response.status).send(user);
+
+        if (response.status === 200 && body?.user) {
+            sendTokenCookie(res, body.user);
+        }
+
+        return res.status(response.status).send(body);
     } catch (err) {
         console.error('Sign-in failed:', err);
         return res.status(500).send({ message: 'Sign-in failed', error: err.message });
@@ -112,8 +156,14 @@ app.post(['/api/auth/sign-up', '/api/register'], async (req, res) => {
         for (const cookie of response.headers.getSetCookie()) {
             res.append('Set-Cookie', cookie);
         }
-        const user = await response.json();
-        return res.status(response.status).send(user);
+        const body = await response.json();
+
+
+        if (response.status === 200 && body?.user) {
+            sendTokenCookie(res, body.user);
+        }
+
+        return res.status(response.status).send(body);
     } catch (err) {
         console.error('Sign-up failed:', err);
         return res.status(500).send({ message: 'Sign-up failed', error: err.message });
@@ -148,7 +198,8 @@ export async function connectToMongoDB() {
 connectToMongoDB();
 
 
-app.post('/add-studio', async (req, res) => {
+
+app.post(['/studios', '/add-studio', '/api/studios'], verifyToken, async (req, res) => {
     try {
         const { hostName, hostEmail, title, category, hourlyRate, securityDeposit, maxCapacity, location, imageUrl, amenities, overview, createdAt } = req.body ?? {};
 
@@ -228,7 +279,7 @@ app.get('/studios/:id', async (req, res) => {
     try {
         const { id } = req.params;
 
-        // Guard against malformed ids (invalid ObjectId would throw)
+
         if (!ObjectId.isValid(id)) {
             return res.status(404).send({ message: 'Studio not found' });
         }
@@ -248,11 +299,7 @@ app.get('/studios/:id', async (req, res) => {
     }
 })
 
-// ==========================================
-// PUT /studios/:id  (also /api/studios/:id)
-// Update a studio listing. Numeric fields are cast/validated before $set,
-// and the full updated document is returned.
-// ==========================================
+
 const STUDIO_UPDATE_FIELDS = ['title', 'category', 'location', 'imageUrl', 'overview', 'hostName', 'hostEmail'];
 const STUDIO_NUMBER_FIELDS = ['hourlyRate', 'securityDeposit', 'maxCapacity'];
 
@@ -261,14 +308,14 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
         const { id } = req.params;
         const updatedData = req.body ?? {};
 
-        // validation failure -> 400, no matching document -> 404
+
         if (!ObjectId.isValid(id)) {
             return res.status(400).send({ message: 'Invalid studio id' });
         }
 
         const setFields = {};
 
-        // string fields: only apply when provided, must be a non-empty string
+
         for (const field of STUDIO_UPDATE_FIELDS) {
             if (updatedData[field] !== undefined) {
                 if (typeof updatedData[field] !== 'string') {
@@ -278,7 +325,7 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
             }
         }
 
-        // numeric fields: cast form values ("55") to numbers, reject garbage
+
         for (const field of STUDIO_NUMBER_FIELDS) {
             if (updatedData[field] !== undefined && updatedData[field] !== '') {
                 const n = Number(updatedData[field]);
@@ -289,7 +336,7 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
             }
         }
 
-        // amenities: must be an array of strings when provided
+
         if (updatedData.amenities !== undefined) {
             if (!Array.isArray(updatedData.amenities) || updatedData.amenities.some((a) => typeof a !== 'string')) {
                 return res.status(400).send({ message: `'amenities' must be an array of strings` });
@@ -301,11 +348,11 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
             return res.status(400).send({ message: 'No valid studio fields provided to update' });
         }
 
-        // native driver equivalent of findByIdAndUpdate(id, data, { new: true })
+
         const updatedStudio = await db.collection('studios').findOneAndUpdate(
             { _id: new ObjectId(id) },
             { $set: setFields },
-            { returnDocument: 'after' },  // return the document as it looks AFTER the update
+            { returnDocument: 'after' },
         );
 
         if (!updatedStudio) {
@@ -323,20 +370,17 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
     }
 });
 
-// ==========================================
-// DELETE /studios/:id  (also /api/studios/:id)
-// Delete a studio listing by its _id.
-// ==========================================
-app.delete(['/studios/:id', '/api/studios/:id'], async (req, res) => {
+
+app.delete(['/studios/:id', '/api/studios/:id'], verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
 
-        // an id that can't exist matches no document -> 404 (same as a miss)
+
         if (!ObjectId.isValid(id)) {
             return res.status(404).send({ message: 'Studio not found' });
         }
 
-        // native driver equivalent of findByIdAndDelete(id)
+
         const deletedStudio = await db.collection('studios').findOneAndDelete({ _id: new ObjectId(id) });
 
         if (!deletedStudio) {
@@ -354,13 +398,8 @@ app.delete(['/studios/:id', '/api/studios/:id'], async (req, res) => {
 });
 
 
-// ==========================================
-// Bookings (StudioSpace booking system)
-// ==========================================
 
-// POST /bookings (also /api/bookings)
-// Creates a booking reservation. Default status "Pending" + createdAt timestamp.
-app.post(['/bookings', '/api/bookings'], async (req, res) => {
+app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
     try {
         const { studioId, studioTitle, studioImage, location, hourlyRate, userName, userEmail, bookingDate, timeSlot } = req.body ?? {};
 
@@ -373,7 +412,7 @@ app.post(['/bookings', '/api/bookings'], async (req, res) => {
 
         const n = Number(hourlyRate);
         const newBooking = {
-            studioId,                       // stored as sent; stringify-safe for the frontend
+            studioId,
             studioTitle: studioTitle || '',
             studioImage: studioImage || '',
             location: location || '',
@@ -382,8 +421,8 @@ app.post(['/bookings', '/api/bookings'], async (req, res) => {
             userEmail,
             bookingDate,
             timeSlot,
-            status: 'Pending',              // default status
-            createdAt: new Date(),          // timestamp
+            status: 'Pending',
+            createdAt: new Date(),
         };
 
         const result = await db.collection('bookings').insertOne(newBooking);
@@ -400,9 +439,7 @@ app.post(['/bookings', '/api/bookings'], async (req, res) => {
     }
 });
 
-// GET /bookings (also /api/bookings)
-// Optional filter: /bookings?email=user@example.com -> matches userEmail.
-// Always sorted by createdAt descending (newest first).
+
 app.get(['/bookings', '/api/bookings'], async (req, res) => {
     try {
         const { email } = req.query;
@@ -424,8 +461,7 @@ app.get(['/bookings', '/api/bookings'], async (req, res) => {
     }
 });
 
-// DELETE /bookings/:id (also /api/bookings/:id)
-// Removes a booking by its _id (ObjectId).
+
 app.delete(['/bookings/:id', '/api/bookings/:id'], async (req, res) => {
     try {
         const { id } = req.params;
@@ -499,7 +535,7 @@ app.get('/bookings', async (req, res) => {
         const { email } = req.query;
 
         const query = {};
-        // "My Bookings": allow filtering by the booker's email
+
         if (email) {
             query.userEmail = email;
         }
@@ -516,7 +552,7 @@ app.get('/bookings', async (req, res) => {
     }
 })
 
-//cancel (delete) a booking by id:
+//delete a booking by id:
 app.delete('/bookings/:id', async (req, res) => {
     try {
         const id = req.params.id;

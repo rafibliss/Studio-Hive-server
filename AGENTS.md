@@ -13,6 +13,7 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
 
 ## Data endpoints (all JSON + CORS-credentialed from localhost:3000)
 
+- **JWT-protected mutations** (simple `jsonwebtoken` + `cookie-parser` layer, independent of Better Auth sessions): `verifyToken` middleware reads the HTTPOnly `token` cookie, verifies it against `JWT_SECRET` (`.env`), 401s when missing/invalid, else sets `req.user = { id, email }`. Applied to: `POST /studios` (aliases `/add-studio`, `/api/studios`), `DELETE /studios/:id`, `POST /bookings`. The `token` cookie (1-day expiry) is issued by `sendTokenCookie()` on register/login — Google social login does NOT set it.
 - Studios: `POST /add-studio`, `GET /studios` (`?limit`, `?category`, `?email`), `GET /studios/:id`, `PUT`/`DELETE /studios/:id` (both also under `/api/studios/:id`).
   - Update/delete validate the ObjectId first: malformed id → 400/404, well-formed-but-missing → 404. PUT casts numeric fields (`hourlyRate`, `securityDeposit`, `maxCapacity`) and rejects bad types with 400; returns `{ success, message, studio }` (the doc after update).
 - Bookings (collection `bookings`): `POST /bookings` (requires `studioId`, `userEmail`, `bookingDate`, `timeSlot`; defaults `status: "Pending"`, `createdAt: now`), `GET /bookings` (`?email=` maps to `userEmail`, sorted `createdAt: -1`), `DELETE /bookings/:id`. All also under `/api/bookings`.
