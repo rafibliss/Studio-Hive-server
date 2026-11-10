@@ -45,7 +45,16 @@ app.use(cors({
 
 
 const nuAuth = toNodeHandler(auth);
-const AUTH_ALIASES = new Set(['/api/auth/sign-in', '/api/auth/sign-up', '/api/auth/me']);
+// Paths handled by our Express handlers below (they need express.json() and must
+// issue the JWT cookie). Everything else under /api/auth/* belongs to Better Auth.
+const AUTH_ALIASES = new Set([
+    '/api/auth/sign-in', '/api/auth/sign-up', '/api/auth/me',
+    // Better Auth's NATIVE endpoint paths - the frontend authClient calls these,
+    // and they must produce our JWT cookie too, so they go through our handlers.
+    '/api/auth/sign-in/email', '/api/auth/sign-up/email',
+    // Google OAuth callback - handled by us so social users also get the JWT cookie
+    '/api/auth/callback/google',
+]);
 app.use((req, res, next) => {
     if (req.path.startsWith('/api/auth/') && !AUTH_ALIASES.has(req.path)) {
         return nuAuth(req, res, next);
@@ -63,7 +72,7 @@ function createToken(user) {
     return jwt.sign(
         { id: user.id, email: user.email },
         process.env.JWT_SECRET,
-        { expiresIn: '1d' },
+        { expiresIn: '7d' }, // matches the cookie maxAge below
     );
 }
 
@@ -71,8 +80,10 @@ function createToken(user) {
 function sendTokenCookie(res, user) {
     res.cookie('token', createToken(user), {
         httpOnly: true,
-        sameSite: 'lax',
-        maxAge: 24 * 60 * 60 * 1000,
+        secure: false,              // must be false for local HTTP (localhost:3000 ↔ localhost:8000)
+        sameSite: 'lax',            // fine here: both origins are same-site (localhost)
+        path: '/',
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days, matches JWT expiry above
     });
 }
 
@@ -95,9 +106,11 @@ function verifyToken(req, res, next) {
 
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Where the Next.js frontend runs - Google OAuth success redirects land here
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 //login 
-app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
+app.post(['/api/auth/sign-in', '/api/auth/sign-in/email', '/api/login'], async (req, res) => {
     const { email, password } = req.body ?? {};
 
     if (!email || !password) {
@@ -128,7 +141,7 @@ app.post(['/api/auth/sign-in', '/api/login'], async (req, res) => {
 });
 
 //signup
-app.post(['/api/auth/sign-up', '/api/register'], async (req, res) => {
+app.post(['/api/auth/sign-up', '/api/auth/sign-up/email', '/api/register'], async (req, res) => {
     const { name, email, password } = req.body ?? {};
 
     if (!name || !email || !password) {
@@ -182,6 +195,62 @@ app.get(['/api/auth/me', '/api/session'], async (req, res) => {
     } catch (err) {
         console.error('Session check failed:', err);
         return res.status(500).send({ message: 'Session check failed', error: err.message });
+    }
+});
+
+// GET /api/auth/callback/google
+// Google redirects here with ?code... after the consent screen. We run the
+// OAuth callback ourselves (instead of letting Better Auth's raw handler do it)
+// for two reasons:
+//   1. to issue our simple JWT cookie (same as email/password login), and
+//   2. to redirect the user back to the FRONTEND, not the backend root.
+app.get('/api/auth/callback/google', async (req, res) => {
+    try {
+        // Let Better Auth validate code/state, exchange tokens, create the user
+        // (if new) and the session. asResponse: true gives us its redirect + cookies.
+        // params is required: Better Auth's endpoint path is /callback/:id, and a
+        // direct api() call does not infer it from the Express URL.
+        const response = await auth.api.callbackOAuth({
+            params: { id: 'google' },
+            query: req.query,
+            headers: req.headers,
+            asResponse: true,
+        });
+
+        // forward Better Auth's cookies (its session token) to the browser
+        const setCookies = response.headers.getSetCookie?.() ?? [];
+        for (const cookie of setCookies) {
+            res.append('Set-Cookie', cookie);
+        }
+
+        // Issue our JWT cookie for social users too: look up the just-created
+        // session from the cookies we just forwarded, then reuse sendTokenCookie()
+        const sessionCookie = setCookies.map((c) => c.split(';')[0]).join('; ');
+        if (sessionCookie) {
+            const session = await auth.api.getSession({ headers: { cookie: sessionCookie } });
+            if (session?.user) {
+                sendTokenCookie(res, session.user);
+            }
+        }
+
+        // Google users end up back on the frontend (e.g. "/" on :3000), but
+        // Better Auth's internal error page lives on ITS origin
+        // (e.g. :8000/api/auth/error?error=state_not_found) - rewrite those to
+        // the frontend login page so users never see the backend.
+        const location = response.headers.get('location') || FRONTEND_URL;
+        let finalLocation = location;
+        if (location.includes('/api/auth/error')) {
+            const errorUrl = new URL(location);
+            const errorParam = errorUrl.searchParams.get('error') || 'unknown';
+            finalLocation = `${FRONTEND_URL}/login?action=google&status=error&error=${encodeURIComponent(errorParam)}`;
+        }
+        return res.redirect(302, finalLocation);
+    } catch (err) {
+        console.error('Google OAuth callback failed:', err);
+        // Surface the real reason in the redirect so the browser URL shows why the
+        // Google flow failed (e.g. invalid_grant when a code was reused/expired).
+        const reason = err?.message || err?.body?.message || 'unknown';
+        return res.redirect(302, `${FRONTEND_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
     }
 });
 
@@ -399,6 +468,72 @@ app.delete(['/studios/:id', '/api/studios/:id'], verifyToken, async (req, res) =
 
 
 
+// ─── Booking double-booking prevention (Challenge 2) ───────────────────────
+
+/** Parse "HH:MM" (24h format, as produced by <input type="time">) into minutes since midnight */
+function parseSlotTime(value) {
+    if (typeof value !== 'string') return null;
+    const match = value.trim().match(/^(\d{1,2}):(\d{2})$/);
+    if (!match) return null;
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+    return hours * 60 + minutes;
+}
+
+/** Extract the start/end (in minutes) of a stored timeSlot string, e.g. "10:00 – 12:00" */
+function parseSlotRange(timeSlot) {
+    if (typeof timeSlot !== 'string') return null;
+    // Accept en dash / em dash / hyphen separators
+    const parts = timeSlot.split(/\s*[–—-]\s*/).filter(Boolean);
+    if (parts.length !== 2) return null;
+    const start = parseSlotTime(parts[0]);
+    const end = parseSlotTime(parts[1]);
+    if (start === null || end === null || end <= start) return null;
+    return { start, end };
+}
+
+/**
+ * Challenge 2 — double-booking prevention.
+ * Rejects a new reservation when an active booking (Pending or Confirmed)
+ * for the same studio + date overlaps the requested time slot. Cancelled
+ * bookings never block; Completed ones are already in the past.
+ * Returns the conflicting booking document, or null when free.
+ */
+async function findConflictingBooking(studioId, bookingDate, timeSlot) {
+    const requested = parseSlotRange(timeSlot);
+
+    const activeBookings = await db.collection('bookings')
+        .find({
+            studioId,
+            bookingDate,
+            status: { $in: ['Pending', 'Confirmed'] },
+        })
+        .toArray();
+
+    return (
+        activeBookings.find((booking) => {
+            // Identical slot text is always a conflict, even if unparseable
+            if (booking.timeSlot === timeSlot) return true;
+            if (!requested) return false;
+            const existing = parseSlotRange(booking.timeSlot);
+            if (!existing) return false;
+            // Classic interval-overlap test: aStart < rEnd && rStart < aEnd
+            return requested.start < existing.end && existing.start < requested.end;
+        }) || null
+    );
+}
+
+/** Shared 400 response for a conflicting reservation */
+function sendBookingConflict(res, conflict) {
+    return res.status(400).send({
+        success: false,
+        message: 'This studio is already booked for the selected time slot. Please pick a different date or time.',
+        conflictingBookingId: conflict._id,
+    });
+}
+
+
 app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
     try {
         const { studioId, studioTitle, studioImage, location, hourlyRate, userName, userEmail, bookingDate, timeSlot } = req.body ?? {};
@@ -411,6 +546,13 @@ app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
         }
 
         const n = Number(hourlyRate);
+
+        // Challenge 2 — reject the reservation if the slot is already taken
+        const conflict = await findConflictingBooking(studioId, bookingDate, timeSlot);
+        if (conflict) {
+            return sendBookingConflict(res, conflict);
+        }
+
         const newBooking = {
             studioId,
             studioTitle: studioTitle || '',
@@ -500,6 +642,12 @@ app.post('/bookings', async (req, res) => {
         }
         if (hourlyRate !== undefined && hourlyRate !== null && !Number.isFinite(Number(hourlyRate))) {
             return res.status(400).send({ message: 'hourlyRate must be a number' });
+        }
+
+        // Challenge 2 — reject the reservation if the slot is already taken
+        const conflict = await findConflictingBooking(studioId, bookingDate, timeSlot);
+        if (conflict) {
+            return sendBookingConflict(res, conflict);
         }
 
         const newBooking = {
