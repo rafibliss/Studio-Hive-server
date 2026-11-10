@@ -267,7 +267,7 @@ function withImages(studio) {
 function parseImagesInput(body) {
     if (body.images === undefined) return undefined;
     if (!Array.isArray(body.images) || body.images.some((a) => typeof a !== 'string')) {
-        return null; // malformed -> caller responds 400
+        return null;
     }
     return body.images.filter((a) => a.trim() !== '');
 }
@@ -594,11 +594,17 @@ app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
 
 app.get(['/bookings', '/api/bookings'], async (req, res) => {
     try {
-        const { email } = req.query;
+        const { email, status } = req.query;
 
         const query = {};
         if (email) {
             query.userEmail = email;
+        }
+        if (status) {
+            if (!BOOKING_STATUSES.includes(status)) {
+                return res.status(400).send({ message: `'status' must be one of: ${BOOKING_STATUSES.join(', ')}` });
+            }
+            query.status = status;
         }
 
         const bookings = await db.collection('bookings')
@@ -606,7 +612,10 @@ app.get(['/bookings', '/api/bookings'], async (req, res) => {
             .sort({ createdAt: -1 })
             .toArray();
 
-        return res.status(200).send(bookings);
+
+        return res.status(200).send(
+            bookings.map((booking) => ({ ...booking, status: booking.status || 'Pending' })),
+        );
     } catch (err) {
         console.error('Failed to fetch bookings:', err);
         return res.status(500).send({ message: 'Failed to fetch bookings', error: err.message });
@@ -638,6 +647,144 @@ app.delete(['/bookings/:id', '/api/bookings/:id'], async (req, res) => {
     }
 });
 
+
+
+
+const BOOKING_STATUSES = ['Pending', 'Confirmed', 'Completed', 'Cancelled'];
+
+const BOOKING_TRANSITIONS = {
+    Pending: ['Confirmed', 'Cancelled'],
+    Confirmed: ['Completed', 'Cancelled'],
+    Completed: [],
+    Cancelled: [],
+};
+
+function ownsBooking(booking, user) {
+    return (
+        typeof booking?.userEmail === 'string' &&
+        typeof user?.email === 'string' &&
+        booking.userEmail.trim().toLowerCase() === user.email.trim().toLowerCase()
+    );
+}
+
+
+app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        const bookings = db.collection('bookings');
+        const booking = await bookings.findOne({ _id: new ObjectId(id) });
+
+        if (!booking) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        if (!ownsBooking(booking, req.user)) {
+            return res.status(403).send({ message: 'You can only cancel your own bookings' });
+        }
+
+        if (booking.status === 'Cancelled') {
+            return res.status(200).send({
+                success: true,
+                message: 'Booking is already cancelled',
+                booking,
+            });
+        }
+
+        if (booking.status !== 'Pending') {
+            return res.status(400).send({
+                message: `Only pending bookings can be cancelled (current status: ${booking.status})`,
+            });
+        }
+
+
+        const cancelled = await bookings.findOneAndUpdate(
+            { _id: new ObjectId(id), status: 'Pending' },
+            { $set: { status: 'Cancelled' } },
+            { returnDocument: 'after' },
+        );
+
+        if (!cancelled) {
+            return res.status(400).send({ message: 'Booking status changed, cannot cancel anymore' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: 'Booking cancelled successfully',
+            booking: cancelled,
+        });
+    } catch (err) {
+        console.error('Failed to cancel booking:', err);
+        return res.status(500).send({ message: 'Failed to cancel booking', error: err.message });
+    }
+});
+
+
+app.patch(['/bookings/:id', '/api/bookings/:id'], verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status: nextStatus } = req.body ?? {};
+
+        if (!BOOKING_STATUSES.includes(nextStatus)) {
+            return res.status(400).send({
+                message: `'status' is required and must be one of: ${BOOKING_STATUSES.join(', ')}`,
+            });
+        }
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        const bookings = db.collection('bookings');
+        const booking = await bookings.findOne({ _id: new ObjectId(id) });
+
+        if (!booking) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+
+        if (!ownsBooking(booking, req.user)) {
+            return res.status(403).send({ message: 'You can only update your own bookings' });
+        }
+
+        if (booking.status === nextStatus) {
+            return res.status(200).send({
+                success: true,
+                message: `Booking is already ${nextStatus}`,
+                booking,
+            });
+        }
+
+        const allowed = BOOKING_TRANSITIONS[booking.status] ?? [];
+        if (!allowed.includes(nextStatus)) {
+            return res.status(400).send({
+                message: `Cannot change status from '${booking.status}' to '${nextStatus}'`,
+            });
+        }
+
+        const updated = await bookings.findOneAndUpdate(
+            { _id: new ObjectId(id), status: booking.status },
+            { $set: { status: nextStatus } },
+            { returnDocument: 'after' },
+        );
+
+        if (!updated) {
+            return res.status(400).send({ message: 'Booking status changed, please retry' });
+        }
+
+        return res.status(200).send({
+            success: true,
+            message: `Booking marked as ${nextStatus}`,
+            booking: updated,
+        });
+    } catch (err) {
+        console.error('Failed to update booking status:', err);
+        return res.status(500).send({ message: 'Failed to update booking status', error: err.message });
+    }
+});
 
 //booking creation api:
 app.post('/bookings', async (req, res) => {

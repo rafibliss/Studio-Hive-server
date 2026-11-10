@@ -24,6 +24,10 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
     - PUT with `images` replaces the gallery AND syncs `imageUrl` to `images[0]`; PUT with only `imageUrl` rebuilds the gallery to `[imageUrl]`. Legacy docs without `images` are normalized on read (derived from `image`/`imageUrl`) with no DB write.
   - Update/delete validate the ObjectId first: malformed id → 400/404, well-formed-but-missing → 404. PUT casts numeric fields (`hourlyRate`, `securityDeposit`, `maxCapacity`) and rejects bad types with 400; returns `{ success, message, studio }` (the doc after update).
 - Bookings (collection `bookings`): `POST /bookings` (requires `studioId`, `userEmail`, `bookingDate`, `timeSlot`; defaults `status: "Pending"`, `createdAt: now`), `GET /bookings` (`?email=` maps to `userEmail`, sorted `createdAt: -1`), `DELETE /bookings/:id`. All also under `/api/bookings`.
+  - **Status management**: statuses are the enum `Pending | Confirmed | Completed | Cancelled`, default `Pending` at creation. No Mongoose model — rules live in `index.js` (`BOOKING_STATUSES` / `BOOKING_TRANSITIONS`).
+  - `PATCH /bookings/:id/cancel` (JWT-protected): cancels the **caller's own** booking (case-insensitive email match) and **only if `status: "Pending"`**; re-checks status in the update filter to avoid racing a concurrent confirm/completion. Idempotent on already-cancelled bookings, 403 for other users' bookings, 400 "only pending" otherwise.
+  - `PATCH /bookings/:id` (JWT-protected, body `{ status }`): owner-only lifecycle move with allowed transitions `Pending→Confirmed/Cancelled`, `Confirmed→Completed/Cancelled` (terminal states accept nothing); reuse the update filter race guard.
+  - `GET /bookings` always returns a badge-ready `status` (older docs without one default to `Pending` in the response, no DB write) and accepts an optional `?status=` enum filter. Conflict detection treats `Cancelled`/`Completed` as inactive (only `Pending`/`Confirmed` block a slot).
 
 ## Auth (Better Auth)
 
