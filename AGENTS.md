@@ -8,6 +8,7 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
 
 - Run the server: `node index.js` (no start/dev script; `npm test` intentionally fails with "no test specified").
 - Seed sample studios: `npm run seed` (`seed.js`, idempotent — deletes and re-inserts only docs with `hostEmail: "alex@studiohive.com"`).
+- Seed 5 gallery-demo listings: `npm run seed:samples` (`seed-samples.js`, idempotent — deletes and re-inserts only docs with `hostEmail: "samples@studiohive.com"`; one studio per genre: vocal booth, full-band tracking, electronic mastering, vintage analog, modern production lounge, each with a 3-image gallery).
 - No lint, typecheck, or build step.
 - Manual verification: `curl http://localhost:8000` → `{"msg":"server is running fine "}`.
 
@@ -17,6 +18,10 @@ Backend API server for "studio-space". The entire server lives in `index.js` (ES
 - **JWT issuance covers BOTH route layers**: the frontend authClient calls Better Auth's native paths, so `/api/auth/sign-in/email` and `/api/auth/sign-up/email` are registered on the same Express handlers as the aliases AND listed in `AUTH_ALIASES` (so nuAuth skips them). Adding another frontend login path that must issue a JWT → route it through these handlers, not nuAuth.
 - **The frontend (`../studio-space`) authClient must point HERE** (`NEXT_PUBLIC_BETTER_AUTH_URL=http://localhost:8000` in its `.env`). Two traps caused "Invalid origin" + missing-JWT bugs: (1) the frontend has its own Better Auth instance (`src/lib/auth.ts` + `/api/auth/[...all]` route) — if requests land there, better-auth infers baseURL from its `BETTER_AUTH_URL` env (:8000) while requests come from :3000 → "Invalid origin"; it now has `trustedOrigins: ['http://localhost:3000']` as a fallback guard. (2) `process.env.BETTER_AUTH_URL` is undefined in Next.js client bundles (only `NEXT_PUBLIC_*` is inlined), so the browser authClient silently fell back to same-origin (:3000) and bypassed this backend. The authClient (`auth-client.ts`) must resolve to :8000 in the browser.
 - Studios: `POST /add-studio`, `GET /studios` (`?limit`, `?category`, `?email`), `GET /studios/:id`, `PUT`/`DELETE /studios/:id` (both also under `/api/studios/:id`).
+  - **Gallery**: every studio doc carries an `images` array of URL strings (the legacy single `image`/`imageUrl` field is kept). All read/write paths accept and return `images`:
+    - POST and PUT validate `images` as an array of strings (malformed input → 400 `'images' must be an array of strings`); an empty array is fine.
+    - POST derives `images` from `imageUrl` when `images` is omitted.
+    - PUT with `images` replaces the gallery AND syncs `imageUrl` to `images[0]`; PUT with only `imageUrl` rebuilds the gallery to `[imageUrl]`. Legacy docs without `images` are normalized on read (derived from `image`/`imageUrl`) with no DB write.
   - Update/delete validate the ObjectId first: malformed id → 400/404, well-formed-but-missing → 404. PUT casts numeric fields (`hourlyRate`, `securityDeposit`, `maxCapacity`) and rejects bad types with 400; returns `{ success, message, studio }` (the doc after update).
 - Bookings (collection `bookings`): `POST /bookings` (requires `studioId`, `userEmail`, `bookingDate`, `timeSlot`; defaults `status: "Pending"`, `createdAt: now`), `GET /bookings` (`?email=` maps to `userEmail`, sorted `createdAt: -1`), `DELETE /bookings/:id`. All also under `/api/bookings`.
 

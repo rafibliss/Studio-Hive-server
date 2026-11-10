@@ -45,14 +45,12 @@ app.use(cors({
 
 
 const nuAuth = toNodeHandler(auth);
-// Paths handled by our Express handlers below (they need express.json() and must
-// issue the JWT cookie). Everything else under /api/auth/* belongs to Better Auth.
+
 const AUTH_ALIASES = new Set([
     '/api/auth/sign-in', '/api/auth/sign-up', '/api/auth/me',
-    // Better Auth's NATIVE endpoint paths - the frontend authClient calls these,
-    // and they must produce our JWT cookie too, so they go through our handlers.
+
     '/api/auth/sign-in/email', '/api/auth/sign-up/email',
-    // Google OAuth callback - handled by us so social users also get the JWT cookie
+
     '/api/auth/callback/google',
 ]);
 app.use((req, res, next) => {
@@ -72,7 +70,7 @@ function createToken(user) {
     return jwt.sign(
         { id: user.id, email: user.email },
         process.env.JWT_SECRET,
-        { expiresIn: '7d' }, // matches the cookie maxAge below
+        { expiresIn: '7d' },
     );
 }
 
@@ -80,10 +78,10 @@ function createToken(user) {
 function sendTokenCookie(res, user) {
     res.cookie('token', createToken(user), {
         httpOnly: true,
-        secure: false,              // must be false for local HTTP (localhost:3000 ↔ localhost:8000)
-        sameSite: 'lax',            // fine here: both origins are same-site (localhost)
+        secure: false,
+        sameSite: 'lax',
         path: '/',
-        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days, matches JWT expiry above
+        maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 }
 
@@ -106,7 +104,7 @@ function verifyToken(req, res, next) {
 
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-// Where the Next.js frontend runs - Google OAuth success redirects land here
+
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 //login 
@@ -198,18 +196,10 @@ app.get(['/api/auth/me', '/api/session'], async (req, res) => {
     }
 });
 
-// GET /api/auth/callback/google
-// Google redirects here with ?code... after the consent screen. We run the
-// OAuth callback ourselves (instead of letting Better Auth's raw handler do it)
-// for two reasons:
-//   1. to issue our simple JWT cookie (same as email/password login), and
-//   2. to redirect the user back to the FRONTEND, not the backend root.
+
 app.get('/api/auth/callback/google', async (req, res) => {
     try {
-        // Let Better Auth validate code/state, exchange tokens, create the user
-        // (if new) and the session. asResponse: true gives us its redirect + cookies.
-        // params is required: Better Auth's endpoint path is /callback/:id, and a
-        // direct api() call does not infer it from the Express URL.
+
         const response = await auth.api.callbackOAuth({
             params: { id: 'google' },
             query: req.query,
@@ -217,14 +207,13 @@ app.get('/api/auth/callback/google', async (req, res) => {
             asResponse: true,
         });
 
-        // forward Better Auth's cookies (its session token) to the browser
+
         const setCookies = response.headers.getSetCookie?.() ?? [];
         for (const cookie of setCookies) {
             res.append('Set-Cookie', cookie);
         }
 
-        // Issue our JWT cookie for social users too: look up the just-created
-        // session from the cookies we just forwarded, then reuse sendTokenCookie()
+
         const sessionCookie = setCookies.map((c) => c.split(';')[0]).join('; ');
         if (sessionCookie) {
             const session = await auth.api.getSession({ headers: { cookie: sessionCookie } });
@@ -233,10 +222,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
             }
         }
 
-        // Google users end up back on the frontend (e.g. "/" on :3000), but
-        // Better Auth's internal error page lives on ITS origin
-        // (e.g. :8000/api/auth/error?error=state_not_found) - rewrite those to
-        // the frontend login page so users never see the backend.
+
         const location = response.headers.get('location') || FRONTEND_URL;
         let finalLocation = location;
         if (location.includes('/api/auth/error')) {
@@ -247,8 +233,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
         return res.redirect(302, finalLocation);
     } catch (err) {
         console.error('Google OAuth callback failed:', err);
-        // Surface the real reason in the redirect so the browser URL shows why the
-        // Google flow failed (e.g. invalid_grant when a code was reused/expired).
+
         const reason = err?.message || err?.body?.message || 'unknown';
         return res.redirect(302, `${FRONTEND_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
     }
@@ -268,12 +253,36 @@ connectToMongoDB();
 
 
 
+
+
+function withImages(studio) {
+    if (!studio) return studio;
+    const gallery = Array.isArray(studio.images)
+        ? studio.images
+        : (studio.image || studio.imageUrl ? [studio.image || studio.imageUrl] : []);
+    return { ...studio, images: gallery };
+}
+
+
+function parseImagesInput(body) {
+    if (body.images === undefined) return undefined;
+    if (!Array.isArray(body.images) || body.images.some((a) => typeof a !== 'string')) {
+        return null; // malformed -> caller responds 400
+    }
+    return body.images.filter((a) => a.trim() !== '');
+}
+
 app.post(['/studios', '/add-studio', '/api/studios'], verifyToken, async (req, res) => {
     try {
-        const { hostName, hostEmail, title, category, hourlyRate, securityDeposit, maxCapacity, location, imageUrl, amenities, overview, createdAt } = req.body ?? {};
+        const { hostName, hostEmail, title, category, hourlyRate, securityDeposit, maxCapacity, location, imageUrl, images, amenities, overview, createdAt } = req.body ?? {};
 
         if (!title || typeof title !== 'string') {
             return res.status(400).send({ message: "Studio 'title' is required and must be a string" });
+        }
+
+        const galleryInput = parseImagesInput(req.body ?? {});
+        if (galleryInput === null) {
+            return res.status(400).send({ message: "'images' must be an array of strings" });
         }
 
 
@@ -291,7 +300,10 @@ app.post(['/studios', '/add-studio', '/api/studios'], verifyToken, async (req, r
             securityDeposit: toNumber(securityDeposit),
             maxCapacity: toNumber(maxCapacity),
             location,
+
             imageUrl,
+
+            images: galleryInput ?? (imageUrl ? [imageUrl] : []),
             amenities: Array.isArray(amenities) ? amenities : [],
             overview,
             createdAt: createdAt ? new Date(createdAt) : new Date(),
@@ -335,7 +347,7 @@ app.get('/studios', async (req, res) => {
             .sort({ createdAt: -1 })
             .toArray();
 
-        return res.status(200).send(studios);
+        return res.status(200).send(studios.map(withImages));
     } catch (err) {
         console.error('Failed to fetch studios:', err);
         return res.status(500).send({ message: 'Failed to fetch studios', error: err.message });
@@ -361,7 +373,7 @@ app.get('/studios/:id', async (req, res) => {
             return res.status(404).send({ message: 'Studio not found' });
         }
 
-        return res.status(200).send(studio);
+        return res.status(200).send(withImages(studio));
     } catch (err) {
         console.error('Failed to fetch studio:', err);
         return res.status(500).send({ message: 'Failed to fetch studio', error: err.message });
@@ -413,6 +425,18 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
             setFields.amenities = updatedData.amenities;
         }
 
+
+        const galleryInput = parseImagesInput(updatedData);
+        if (galleryInput === null) {
+            return res.status(400).send({ message: "'images' must be an array of strings" });
+        }
+        if (galleryInput !== undefined) {
+            setFields.images = galleryInput;
+            setFields.imageUrl = galleryInput[0] || '';
+        } else if (updatedData.imageUrl !== undefined) {
+            setFields.images = updatedData.imageUrl ? [updatedData.imageUrl] : [];
+        }
+
         if (Object.keys(setFields).length === 0) {
             return res.status(400).send({ message: 'No valid studio fields provided to update' });
         }
@@ -431,7 +455,7 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
         return res.status(200).send({
             success: true,
             message: 'Studio updated successfully',
-            studio: updatedStudio,
+            studio: withImages(updatedStudio),
         });
     } catch (err) {
         console.error('Failed to update studio:', err);
@@ -468,9 +492,7 @@ app.delete(['/studios/:id', '/api/studios/:id'], verifyToken, async (req, res) =
 
 
 
-// ─── Booking double-booking prevention (Challenge 2) ───────────────────────
 
-/** Parse "HH:MM" (24h format, as produced by <input type="time">) into minutes since midnight */
 function parseSlotTime(value) {
     if (typeof value !== 'string') return null;
     const match = value.trim().match(/^(\d{1,2}):(\d{2})$/);
@@ -481,10 +503,8 @@ function parseSlotTime(value) {
     return hours * 60 + minutes;
 }
 
-/** Extract the start/end (in minutes) of a stored timeSlot string, e.g. "10:00 – 12:00" */
 function parseSlotRange(timeSlot) {
     if (typeof timeSlot !== 'string') return null;
-    // Accept en dash / em dash / hyphen separators
     const parts = timeSlot.split(/\s*[–—-]\s*/).filter(Boolean);
     if (parts.length !== 2) return null;
     const start = parseSlotTime(parts[0]);
@@ -493,13 +513,7 @@ function parseSlotRange(timeSlot) {
     return { start, end };
 }
 
-/**
- * Challenge 2 — double-booking prevention.
- * Rejects a new reservation when an active booking (Pending or Confirmed)
- * for the same studio + date overlaps the requested time slot. Cancelled
- * bookings never block; Completed ones are already in the past.
- * Returns the conflicting booking document, or null when free.
- */
+
 async function findConflictingBooking(studioId, bookingDate, timeSlot) {
     const requested = parseSlotRange(timeSlot);
 
@@ -513,18 +527,15 @@ async function findConflictingBooking(studioId, bookingDate, timeSlot) {
 
     return (
         activeBookings.find((booking) => {
-            // Identical slot text is always a conflict, even if unparseable
             if (booking.timeSlot === timeSlot) return true;
             if (!requested) return false;
             const existing = parseSlotRange(booking.timeSlot);
             if (!existing) return false;
-            // Classic interval-overlap test: aStart < rEnd && rStart < aEnd
             return requested.start < existing.end && existing.start < requested.end;
         }) || null
     );
 }
 
-/** Shared 400 response for a conflicting reservation */
 function sendBookingConflict(res, conflict) {
     return res.status(400).send({
         success: false,
@@ -547,7 +558,6 @@ app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
 
         const n = Number(hourlyRate);
 
-        // Challenge 2 — reject the reservation if the slot is already taken
         const conflict = await findConflictingBooking(studioId, bookingDate, timeSlot);
         if (conflict) {
             return sendBookingConflict(res, conflict);
@@ -644,7 +654,6 @@ app.post('/bookings', async (req, res) => {
             return res.status(400).send({ message: 'hourlyRate must be a number' });
         }
 
-        // Challenge 2 — reject the reservation if the slot is already taken
         const conflict = await findConflictingBooking(studioId, bookingDate, timeSlot);
         if (conflict) {
             return sendBookingConflict(res, conflict);
