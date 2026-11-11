@@ -8,13 +8,16 @@ import { toNodeHandler } from 'better-auth/node';
 import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
 const app = express()
-const PORT = 8000;
+const PORT = process.env.PORT || 8000;
+
+const CLIENT_URL = process.env.CLIENT_URL || process.env.FRONTEND_URL || 'http://localhost:3000';
+const isProd = process.env.NODE_ENV === 'production';
 const client = new MongoClient(process.env.MONGODB_URI);
 const db = client.db('StudioSpace');
 export const auth = betterAuth({
     secret: process.env.BETTER_AUTH_SECRET,
     baseURL: process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`,
-    trustedOrigins: ['http://localhost:3000'],
+    trustedOrigins: [CLIENT_URL],
     database: mongodbAdapter(db, { client }),
     emailAndPassword: {
         enabled: true,
@@ -28,7 +31,7 @@ export const auth = betterAuth({
     },
 });
 app.use(cors({
-    origin: 'http://localhost:3000',
+    origin: CLIENT_URL,
     credentials: true,
 }));
 const nuAuth = toNodeHandler(auth);
@@ -53,10 +56,11 @@ function createToken(user) {
     );
 }
 function sendTokenCookie(res, user) {
+
     res.cookie('token', createToken(user), {
         httpOnly: true,
-        secure: false,
-        sameSite: 'lax',
+        secure: isProd,
+        sameSite: isProd ? 'none' : 'lax',
         path: '/',
         maxAge: 7 * 24 * 60 * 60 * 1000,
     });
@@ -74,7 +78,6 @@ function verifyToken(req, res, next) {
     }
 }
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 app.post(['/api/auth/sign-in', '/api/auth/sign-in/email', '/api/login'], async (req, res) => {
     const { email, password } = req.body ?? {};
     if (!email || !password) {
@@ -163,18 +166,18 @@ app.get('/api/auth/callback/google', async (req, res) => {
                 sendTokenCookie(res, session.user);
             }
         }
-        const location = response.headers.get('location') || FRONTEND_URL;
+        const location = response.headers.get('location') || CLIENT_URL;
         let finalLocation = location;
         if (location.includes('/api/auth/error')) {
             const errorUrl = new URL(location);
             const errorParam = errorUrl.searchParams.get('error') || 'unknown';
-            finalLocation = `${FRONTEND_URL}/login?action=google&status=error&error=${encodeURIComponent(errorParam)}`;
+            finalLocation = `${CLIENT_URL}/login?action=google&status=error&error=${encodeURIComponent(errorParam)}`;
         }
         return res.redirect(302, finalLocation);
     } catch (err) {
         console.error('Google OAuth callback failed:', err);
         const reason = err?.message || err?.body?.message || 'unknown';
-        return res.redirect(302, `${FRONTEND_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
+        return res.redirect(302, `${CLIENT_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
     }
 });
 export async function connectToMongoDB() {
