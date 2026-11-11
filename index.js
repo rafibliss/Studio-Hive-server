@@ -12,8 +12,33 @@ const PORT = process.env.PORT || 8000;
 
 const CLIENT_URL = process.env.CLIENT_URL || process.env.FRONTEND_URL || 'http://localhost:3000';
 const isProd = process.env.NODE_ENV === 'production';
-const client = new MongoClient(process.env.MONGODB_URI);
-const db = client.db('StudioSpace');
+// ─── MongoDB connection (serverless-safe) ───────────────────────────────────
+// Vercel lambdas stay warm across requests and module state is reused, so the
+// client is created and connected ONCE per instance; every request reuses the
+// cached connection instead of opening a new one. The cache sits on globalThis
+// so dev hot-reloaders (nodemon / next dev) don't stack new clients per reload.
+let mongoCache = globalThis.__studioSpaceMongoCache;
+
+if (!mongoCache) {
+    const client = new MongoClient(process.env.MONGODB_URI, {
+        // serverless-friendly: release idle sockets quickly so a frozen lambda
+        // never wakes up against dead server sockets (MongoTopologyClosedError)
+        maxIdleTimeMS: 10000,
+        serverSelectionTimeoutMS: 10000,
+        maxPoolSize: 10,
+    });
+    mongoCache = globalThis.__studioSpaceMongoCache = {
+        client,
+        db: client.db('StudioSpace'),
+        connectPromise: client.connect(),
+    };
+    mongoCache.connectPromise
+        .then(() => console.log('You successfully connected to MongoDB!'))
+        .catch((err) => console.dir(err)); // keep the "server starts even without DB" behavior
+}
+
+const client = mongoCache.client;
+const db = mongoCache.db;
 export const auth = betterAuth({
     secret: process.env.BETTER_AUTH_SECRET,
     baseURL: process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`,
@@ -48,6 +73,17 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 app.use(cookieParser());
+// Serverless: guarantee a live DB connection before any route queries it.
+// Warm instance -> cached promise resolves instantly; cold start -> waits for
+// the one-time handshake. (Better Auth's internal /api/auth/* paths short-
+// circuit earlier via nuAuth; their adapter ops queue on the same handshake.)
+app.use(async (req, res, next) => {
+    const connectedClient = await connectToMongoDB();
+    if (!connectedClient) {
+        return res.status(503).send({ message: 'Database unavailable' });
+    }
+    next();
+});
 function createToken(user) {
     return jwt.sign(
         { id: user.id, email: user.email },
@@ -180,16 +216,19 @@ app.get('/api/auth/callback/google', async (req, res) => {
         return res.redirect(302, `${CLIENT_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
     }
 });
+// Awaited before DB queries (via the global middleware below). On a warm
+// instance the cached promise has already resolved, so this returns in
+// microseconds; on a cold start it waits for the single handshake. Returns
+// null on connection failure so the middleware can respond 503 cleanly.
 export async function connectToMongoDB() {
     try {
-        await client.connect();
-        console.log("You successfully connected to MongoDB!");
-        return client;
+        await mongoCache.connectPromise;
+        return mongoCache.client;
     } catch (err) {
         console.dir(err);
+        return null;
     }
 }
-connectToMongoDB();
 function withImages(studio) {
     if (!studio) return studio;
     const gallery = Array.isArray(studio.images)
