@@ -392,8 +392,17 @@ app.delete(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) =
         if (!ObjectId.isValid(id)) {
             return res.status(404).send({ message: 'Booking not found' });
         }
-        const deleted = await db.collection('bookings').findOneAndDelete({ _id: new ObjectId(id) });
-        if (!deleted) {
+        const bookings = db.collection('bookings');
+        const booking = await bookings.findOne({ _id: new ObjectId(id) });
+        if (!booking) {
+            return res.status(404).send({ message: 'Booking not found' });
+        }
+        const ownershipError = bookingOwnershipError(booking, req.user);
+        if (ownershipError) {
+            return res.status(403).send({ success: false, message: ownershipError });
+        }
+        const deleted = await bookings.deleteOne({ _id: new ObjectId(id) });
+        if (deleted.deletedCount === 0) {
             return res.status(404).send({ message: 'Booking not found' });
         }
         return res.status(200).send({
@@ -412,12 +421,20 @@ const BOOKING_TRANSITIONS = {
     Completed: [],
     Cancelled: [],
 };
-function ownsBooking(booking, user) {
-    return (
-        typeof booking?.userEmail === 'string' &&
-        typeof user?.email === 'string' &&
-        booking.userEmail.trim().toLowerCase() === user.email.trim().toLowerCase()
-    );
+// Returns an error message when `user` (decoded JWT payload) does NOT own
+// `booking`, or null when the check passes. Better Auth JWTs carry the user's
+// email claim; bookings store `userEmail`, matched case-insensitively.
+function bookingOwnershipError(booking, user) {
+    if (!booking || typeof booking.userEmail !== 'string') {
+        return 'Booking record has no userEmail to compare ownership against';
+    }
+    if (typeof user?.email !== 'string') {
+        return "JWT payload has no 'email' claim to match against the booking's userEmail";
+    }
+    if (booking.userEmail.trim().toLowerCase() !== user.email.trim().toLowerCase()) {
+        return 'This booking belongs to another user';
+    }
+    return null;
 }
 app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyJWT, async (req, res) => {
     try {
@@ -430,8 +447,9 @@ app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyJWT, async
         if (!booking) {
             return res.status(404).send({ message: 'Booking not found' });
         }
-        if (!ownsBooking(booking, req.user)) {
-            return res.status(403).send({ message: 'You can only cancel your own bookings' });
+        const ownershipError = bookingOwnershipError(booking, req.user);
+        if (ownershipError) {
+            return res.status(403).send({ success: false, message: ownershipError });
         }
         if (booking.status === 'Cancelled') {
             return res.status(200).send({
@@ -442,6 +460,7 @@ app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyJWT, async
         }
         if (booking.status !== 'Pending') {
             return res.status(400).send({
+                success: false,
                 message: `Only pending bookings can be cancelled (current status: ${booking.status})`,
             });
         }
@@ -451,7 +470,7 @@ app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyJWT, async
             { returnDocument: 'after' },
         );
         if (!cancelled) {
-            return res.status(400).send({ message: 'Booking status changed, cannot cancel anymore' });
+            return res.status(400).send({ success: false, message: 'Booking status changed, cannot cancel anymore' });
         }
         return res.status(200).send({
             success: true,
@@ -469,6 +488,7 @@ app.patch(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) =>
         const { status: nextStatus } = req.body ?? {};
         if (!BOOKING_STATUSES.includes(nextStatus)) {
             return res.status(400).send({
+                success: false,
                 message: `'status' is required and must be one of: ${BOOKING_STATUSES.join(', ')}`,
             });
         }
@@ -480,8 +500,9 @@ app.patch(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) =>
         if (!booking) {
             return res.status(404).send({ message: 'Booking not found' });
         }
-        if (!ownsBooking(booking, req.user)) {
-            return res.status(403).send({ message: 'You can only update your own bookings' });
+        const ownershipError = bookingOwnershipError(booking, req.user);
+        if (ownershipError) {
+            return res.status(403).send({ success: false, message: ownershipError });
         }
         if (booking.status === nextStatus) {
             return res.status(200).send({
@@ -493,6 +514,7 @@ app.patch(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) =>
         const allowed = BOOKING_TRANSITIONS[booking.status] ?? [];
         if (!allowed.includes(nextStatus)) {
             return res.status(400).send({
+                success: false,
                 message: `Cannot change status from '${booking.status}' to '${nextStatus}'`,
             });
         }
@@ -502,7 +524,7 @@ app.patch(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) =>
             { returnDocument: 'after' },
         );
         if (!updated) {
-            return res.status(400).send({ message: 'Booking status changed, please retry' });
+            return res.status(400).send({ success: false, message: 'Booking status changed, please retry' });
         }
         return res.status(200).send({
             success: true,
@@ -593,6 +615,36 @@ app.delete('/bookings/:id', async (req, res) => {
 app.get('/', (req, res) => {
     res.send({ msg: "server is running fine " })
 })
+// ─── Global error handler (must come AFTER all routes) ──────────────────────
+// Without this, body-parser failures (invalid JSON, empty body with a JSON
+// Content-Type, payload too large) fall through to Express 5's default
+// handler, which returns a bare 400 with an HTML body — unreadable by JSON
+// clients. Convert everything to a descriptive JSON response instead.
+app.use((err, req, res, next) => {
+    if (res.headersSent) {
+        return next(err);
+    }
+    if (err?.type === 'entity.parse.failed') {
+        return res.status(400).send({
+            success: false,
+            message: 'Request body is not valid JSON',
+            reason: err.type,
+        });
+    }
+    if (err?.type === 'entity.too.large') {
+        return res.status(413).send({
+            success: false,
+            message: 'Request body too large',
+            reason: err.type,
+        });
+    }
+    console.error('Unhandled request error:', err);
+    return res.status(err?.status || err?.statusCode || 500).send({
+        success: false,
+        message: err?.message || 'Internal server error',
+        reason: err?.type || err?.name,
+    });
+});
 app.listen(PORT, () => {
     console.log(`Server is running on PORT ${PORT}`)
 })
