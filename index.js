@@ -2,21 +2,12 @@ import express from 'express'
 import 'dotenv/config'
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from "cors"
-import { betterAuth } from 'better-auth';
-import { mongodbAdapter } from 'better-auth/adapters/mongodb';
-import { toNodeHandler } from 'better-auth/node';
-import jwt from 'jsonwebtoken';
-import cookieParser from 'cookie-parser';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 const app = express()
 const PORT = process.env.PORT || 8000;
 
 const CLIENT_URL = process.env.CLIENT_URL || process.env.FRONTEND_URL || 'http://localhost:3000';
-const isProd = process.env.NODE_ENV === 'production';
-// ─── MongoDB connection (serverless-safe) ───────────────────────────────────
-// Vercel lambdas stay warm across requests and module state is reused, so the
-// client is created and connected ONCE per instance; every request reuses the
-// cached connection instead of opening a new one. The cache sits on globalThis
-// so dev hot-reloaders (nodemon / next dev) don't stack new clients per reload.
+
 let mongoCache = globalThis.__studioSpaceMongoCache;
 
 if (!mongoCache) {
@@ -39,44 +30,14 @@ if (!mongoCache) {
 
 const client = mongoCache.client;
 const db = mongoCache.db;
-export const auth = betterAuth({
-    secret: process.env.BETTER_AUTH_SECRET,
-    baseURL: process.env.BETTER_AUTH_URL || `http://localhost:${PORT}`,
-    trustedOrigins: [CLIENT_URL],
-    database: mongodbAdapter(db, { client }),
-    emailAndPassword: {
-        enabled: true,
-        minPasswordLength: 8,
-    },
-    socialProviders: {
-        google: {
-            clientId: process.env.GOOGLE_CLIENT_ID,
-            clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-        },
-    },
-});
 app.use(cors({
     origin: CLIENT_URL,
     credentials: true,
 }));
-const nuAuth = toNodeHandler(auth);
-const AUTH_ALIASES = new Set([
-    '/api/auth/sign-in', '/api/auth/sign-up', '/api/auth/me',
-    '/api/auth/sign-in/email', '/api/auth/sign-up/email',
-    '/api/auth/callback/google',
-]);
-app.use((req, res, next) => {
-    if (req.path.startsWith('/api/auth/') && !AUTH_ALIASES.has(req.path)) {
-        return nuAuth(req, res, next);
-    }
-    next();
-});
 app.use(express.json());
-app.use(cookieParser());
 // Serverless: guarantee a live DB connection before any route queries it.
 // Warm instance -> cached promise resolves instantly; cold start -> waits for
-// the one-time handshake. (Better Auth's internal /api/auth/* paths short-
-// circuit earlier via nuAuth; their adapter ops queue on the same handshake.)
+// the one-time handshake.
 app.use(async (req, res, next) => {
     const connectedClient = await connectToMongoDB();
     if (!connectedClient) {
@@ -84,138 +45,47 @@ app.use(async (req, res, next) => {
     }
     next();
 });
-function createToken(user) {
-    return jwt.sign(
-        { id: user.id, email: user.email },
-        process.env.JWT_SECRET,
-        { expiresIn: '7d' },
-    );
-}
-function sendTokenCookie(res, user) {
+// ─── JWT protection (data API only) ─────────────────────────────────────────
+// All authentication (credentials + Google OAuth) lives in the Next.js
+// frontend, whose Better Auth instance has the `jwt()` plugin enabled. It
+// signs tokens ASYMMETRICALLY (EdDSA / Ed25519), so there is no shared
+// secret here: we fetch the PUBLIC keys from the frontend's JWKS endpoint
+// (on the FRONTEND's origin, not this server's) and verify with jose.
+const jwks = createRemoteJWKSet(new URL('/api/auth/jwks', CLIENT_URL), {
+    // jose caches keys; re-fetch at most every 30s per warm instance
+    cooldownDuration: 30000,
+});
 
-    res.cookie('token', createToken(user), {
-        httpOnly: true,
-        secure: isProd,
-        sameSite: isProd ? 'none' : 'lax',
-        path: '/',
-        maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
-}
-function verifyToken(req, res, next) {
-    const token = req.cookies?.token;
+async function verifyJWT(req, res, next) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : null;
     if (!token) {
-        return res.status(401).send({ message: 'Unauthorized: no token provided' });
+        return res.status(401).send({ message: 'Unauthorized: missing Authorization: Bearer <token> header' });
     }
     try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET);
+        // Better Auth jwt() plugin defaults: issuer = audience = the auth
+        // baseURL, i.e. the frontend origin (CLIENT_URL). Algorithm: EdDSA.
+        const { payload } = await jwtVerify(token, jwks, {
+            issuer: CLIENT_URL,
+            audience: CLIENT_URL,
+            algorithms: ['EdDSA'],
+        });
+        // Normalize claims: Better Auth JWTs carry `sub` (user id) + `email`.
+        req.user = { id: payload.sub || payload.id, email: payload.email };
         next();
     } catch (err) {
-        return res.status(401).send({ message: 'Unauthorized: invalid or expired token' });
+        // Surface jose's exact reason (e.g. ERR_JWT_CLAIM_VALIDATION_FAILED
+        // for issuer/audience mismatch, ERR_JWT_EXPIRED, JWKS fetch failures)
+        // so a mismatch between the frontend and this verifier is immediately
+        // visible in the response and in the server log.
+        const reason = err?.code || err?.name || err?.message || 'unknown';
+        console.error('JWT verification failed:', reason, '-', err?.message);
+        return res.status(401).send({
+            message: 'Unauthorized: invalid or expired token',
+            reason,
+        });
     }
 }
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-app.post(['/api/auth/sign-in', '/api/auth/sign-in/email', '/api/login'], async (req, res) => {
-    const { email, password } = req.body ?? {};
-    if (!email || !password) {
-        return res.status(400).send({ message: 'Email and password are required and cannot be empty' });
-    }
-    if (!EMAIL_RE.test(email)) {
-        return res.status(400).send({ message: 'Invalid email format' });
-    }
-    try {
-        const response = await auth.api.signInEmail({ body: { email, password }, asResponse: true });
-        for (const cookie of response.headers.getSetCookie()) {
-            res.append('Set-Cookie', cookie);
-        }
-        const body = await response.json();
-        if (response.status === 200 && body?.user) {
-            sendTokenCookie(res, body.user);
-        }
-        return res.status(response.status).send(body);
-    } catch (err) {
-        console.error('Sign-in failed:', err);
-        return res.status(500).send({ message: 'Sign-in failed', error: err.message });
-    }
-});
-app.post(['/api/auth/sign-up', '/api/auth/sign-up/email', '/api/register'], async (req, res) => {
-    const { name, email, password } = req.body ?? {};
-    if (!name || !email || !password) {
-        return res.status(400).send({ message: 'Name, email and password are required and cannot be empty' });
-    }
-    if (!EMAIL_RE.test(email)) {
-        return res.status(400).send({ message: 'Invalid email format' });
-    }
-    if (typeof password !== 'string' || password.length < 8) {
-        return res.status(400).send({ message: 'Password must be at least 8 characters' });
-    }
-    try {
-        const response = await auth.api.signUpEmail({ body: { name, email, password }, asResponse: true });
-        if (response.status === 422) {
-            const body = await response.json().catch(() => ({}));
-            return res.status(400).send({
-                message: 'Email is already registered',
-                code: body?.code || 'USER_ALREADY_EXISTS',
-            });
-        }
-        for (const cookie of response.headers.getSetCookie()) {
-            res.append('Set-Cookie', cookie);
-        }
-        const body = await response.json();
-        if (response.status === 200 && body?.user) {
-            sendTokenCookie(res, body.user);
-        }
-        return res.status(response.status).send(body);
-    } catch (err) {
-        console.error('Sign-up failed:', err);
-        return res.status(500).send({ message: 'Sign-up failed', error: err.message });
-    }
-});
-app.get(['/api/auth/me', '/api/session'], async (req, res) => {
-    try {
-        const session = await auth.api.getSession({ headers: req.headers });
-        return res.status(200).send({
-            authenticated: Boolean(session),
-            user: session?.user ?? null,
-            session: session?.session ?? null,
-        });
-    } catch (err) {
-        console.error('Session check failed:', err);
-        return res.status(500).send({ message: 'Session check failed', error: err.message });
-    }
-});
-app.get('/api/auth/callback/google', async (req, res) => {
-    try {
-        const response = await auth.api.callbackOAuth({
-            params: { id: 'google' },
-            query: req.query,
-            headers: req.headers,
-            asResponse: true,
-        });
-        const setCookies = response.headers.getSetCookie?.() ?? [];
-        for (const cookie of setCookies) {
-            res.append('Set-Cookie', cookie);
-        }
-        const sessionCookie = setCookies.map((c) => c.split(';')[0]).join('; ');
-        if (sessionCookie) {
-            const session = await auth.api.getSession({ headers: { cookie: sessionCookie } });
-            if (session?.user) {
-                sendTokenCookie(res, session.user);
-            }
-        }
-        const location = response.headers.get('location') || CLIENT_URL;
-        let finalLocation = location;
-        if (location.includes('/api/auth/error')) {
-            const errorUrl = new URL(location);
-            const errorParam = errorUrl.searchParams.get('error') || 'unknown';
-            finalLocation = `${CLIENT_URL}/login?action=google&status=error&error=${encodeURIComponent(errorParam)}`;
-        }
-        return res.redirect(302, finalLocation);
-    } catch (err) {
-        console.error('Google OAuth callback failed:', err);
-        const reason = err?.message || err?.body?.message || 'unknown';
-        return res.redirect(302, `${CLIENT_URL}/login?action=google&status=error&error=${encodeURIComponent(reason)}`);
-    }
-});
 // Awaited before DB queries (via the global middleware below). On a warm
 // instance the cached promise has already resolved, so this returns in
 // microseconds; on a cold start it waits for the single handshake. Returns
@@ -243,7 +113,7 @@ function parseImagesInput(body) {
     }
     return body.images.filter((a) => a.trim() !== '');
 }
-app.post(['/studios', '/add-studio', '/api/studios'], verifyToken, async (req, res) => {
+app.post(['/studios', '/add-studio', '/api/studios'], verifyJWT, async (req, res) => {
     try {
         const { hostName, hostEmail, title, category, hourlyRate, securityDeposit, maxCapacity, location, imageUrl, images, amenities, overview, createdAt } = req.body ?? {};
         if (!title || typeof title !== 'string') {
@@ -327,7 +197,7 @@ app.get('/studios/:id', async (req, res) => {
 })
 const STUDIO_UPDATE_FIELDS = ['title', 'category', 'location', 'imageUrl', 'overview', 'hostName', 'hostEmail'];
 const STUDIO_NUMBER_FIELDS = ['hourlyRate', 'securityDeposit', 'maxCapacity'];
-app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
+app.put(['/studios/:id', '/api/studios/:id'], verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         const updatedData = req.body ?? {};
@@ -389,7 +259,7 @@ app.put(['/studios/:id', '/api/studios/:id'], async (req, res) => {
         return res.status(500).send({ message: 'Failed to update studio', error: err.message });
     }
 });
-app.delete(['/studios/:id', '/api/studios/:id'], verifyToken, async (req, res) => {
+app.delete(['/studios/:id', '/api/studios/:id'], verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -452,7 +322,7 @@ function sendBookingConflict(res, conflict) {
         conflictingBookingId: conflict._id,
     });
 }
-app.post(['/bookings', '/api/bookings'], verifyToken, async (req, res) => {
+app.post(['/bookings', '/api/bookings'], verifyJWT, async (req, res) => {
     try {
         const { studioId, studioTitle, studioImage, location, hourlyRate, userName, userEmail, bookingDate, timeSlot } = req.body ?? {};
         if (!studioId || !userEmail) {
@@ -516,7 +386,7 @@ app.get(['/bookings', '/api/bookings'], async (req, res) => {
         return res.status(500).send({ message: 'Failed to fetch bookings', error: err.message });
     }
 });
-app.delete(['/bookings/:id', '/api/bookings/:id'], async (req, res) => {
+app.delete(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -549,7 +419,7 @@ function ownsBooking(booking, user) {
         booking.userEmail.trim().toLowerCase() === user.email.trim().toLowerCase()
     );
 }
-app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyToken, async (req, res) => {
+app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         if (!ObjectId.isValid(id)) {
@@ -593,7 +463,7 @@ app.patch(['/bookings/:id/cancel', '/api/bookings/:id/cancel'], verifyToken, asy
         return res.status(500).send({ message: 'Failed to cancel booking', error: err.message });
     }
 });
-app.patch(['/bookings/:id', '/api/bookings/:id'], verifyToken, async (req, res) => {
+app.patch(['/bookings/:id', '/api/bookings/:id'], verifyJWT, async (req, res) => {
     try {
         const { id } = req.params;
         const { status: nextStatus } = req.body ?? {};
